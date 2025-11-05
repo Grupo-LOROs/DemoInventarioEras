@@ -3,13 +3,16 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+import io, csv as _csv
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import (create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey, CheckConstraint,
-                        func, select, and_, or_)
+                        func, select, and_, or_, case)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
 # ---------- .env support ----------
@@ -31,7 +34,11 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} i
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["argon2", "pbkdf2_sha256"],  # modern + portable fallback
+    deprecated="auto",
+)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 # ---------- Models ----------
@@ -186,12 +193,29 @@ class ResolveIn(BaseModel):
     discrepancy_type: str
     note: Optional[str] = None
 
+class MinMaxRow(BaseModel):
+    id_code: str
+    min_stock: Optional[int] = None
+    max_stock: Optional[int] = None
+
 # ---------- Auth helpers ----------
-def verify_password(plain_password, password_hash):
-    return pwd_context.verify(plain_password, password_hash)
+
+def _normalize_password(p: str) -> str:
+    if p is None:
+        return ""
+    b = p.encode("utf-8")
+    if len(b) > 72:
+        # still truncate for compatibility if you later re-enable bcrypt
+        p = b[:72].decode("utf-8", errors="ignore")
+    return p
 
 def get_password_hash(password):
+    password = _normalize_password(password)
     return pwd_context.hash(password)
+
+def verify_password(plain_password, password_hash):
+    plain_password = _normalize_password(plain_password)
+    return pwd_context.verify(plain_password, password_hash)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -229,6 +253,22 @@ def require_admin(user: User = Depends(get_current_user)):
     if user.role != "admin":
         raise HTTPException(403, "Forbidden")
     return user
+
+def _current_stock_subquery(db):
+    stock_expr = func.sum(
+        case(
+            (InventoryMovement.movement_type == "IN",  InventoryMovement.quantity),
+            (InventoryMovement.movement_type == "OUT", -InventoryMovement.quantity),
+            else_=InventoryMovement.quantity,
+        )
+    )
+    return (
+        db.query(
+            InventoryMovement.product_id,
+            stock_expr.label("stock")
+        ).group_by(InventoryMovement.product_id)
+    ).subquery()
+
 
 # ---------- App ----------
 app = FastAPI(title="Inventory API v2", version="2.1.0")
@@ -304,17 +344,69 @@ def update_product(id: int, p: ProductUpdate, db=Depends(get_db)):
         setattr(prod, field, value)
     db.commit(); db.refresh(prod); return prod
 
-# Movements
+@app.get("/movements")
+def list_movements(limit: int = 50, offset: int = 0, order: str = "desc", db=Depends(get_db)):
+    q = db.query(
+        InventoryMovement.id,
+        InventoryMovement.product_id,
+        Product.id_code,
+        Product.description,
+        InventoryMovement.movement_type,
+        InventoryMovement.quantity,
+        InventoryMovement.unit_cost,
+        InventoryMovement.moved_at,
+        InventoryMovement.movement_reason,
+        InventoryMovement.note,
+    ).join(Product, Product.id == InventoryMovement.product_id)
+    if order.lower() == "asc":
+        q = q.order_by(InventoryMovement.moved_at.asc())
+    else:
+        q = q.order_by(InventoryMovement.moved_at.desc())
+    rows = q.limit(limit).offset(offset).all()
+    return [dict(
+        id=r[0], product_id=r[1], id_code=r[2], description=r[3],
+        movement_type=r[4], quantity=r[5], unit_cost=r[6], moved_at=r[7],
+        movement_reason=r[8], note=r[9]
+    ) for r in rows]
+
 @app.post("/movements", response_model=MovementOut)
 def create_movement(m: MovementIn, user: User = Depends(get_current_user), db=Depends(get_db)):
+    # Role-based policy
+    allowed_by_role = {
+        "admin": {"IN", "OUT", "ADJ"},
+        "sales": {"OUT"},
+        "purchasing": {"IN"},
+        "user": set(),  # default read-only
+    }
+    allowed = allowed_by_role.get(user.role, set())
+
+    if m.movement_type not in {"IN", "OUT", "ADJ"}:
+        raise HTTPException(400, "movement_type must be IN, OUT, or ADJ")
+    if m.movement_type not in allowed:
+        raise HTTPException(403, f"Role '{user.role}' cannot create {m.movement_type} movements")
+
     prod = db.query(Product).filter(Product.id == m.product_id).first()
-    if not prod: raise HTTPException(404, "Product not found")
-    if (m.movement_type in ("OUT","ADJ")) and abs(m.quantity) >= APPROVAL_THRESHOLD and user.role != "admin":
+    if not prod:
+        raise HTTPException(404, "Product not found")
+
+    # large OUT/ADJ require admin
+    if (m.movement_type in ("OUT", "ADJ")) and abs(m.quantity) >= APPROVAL_THRESHOLD and user.role != "admin":
         raise HTTPException(403, f"Movements of |qty|>={APPROVAL_THRESHOLD} require admin")
+
     moved_at = m.moved_at or datetime.utcnow()
-    obj = InventoryMovement(product_id=m.product_id, movement_type=m.movement_type, quantity=m.quantity,
-                            unit_cost=m.unit_cost, note=m.note, moved_at=moved_at, movement_reason=m.movement_reason)
-    db.add(obj); db.commit(); db.refresh(obj); return obj
+    obj = InventoryMovement(
+        product_id=m.product_id,
+        movement_type=m.movement_type,
+        quantity=m.quantity,
+        unit_cost=m.unit_cost,
+        note=m.note,
+        moved_at=m.moved_at or datetime.utcnow(),
+        movement_reason=m.movement_reason,
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
 
 # Derived stock/valuation
 @app.get("/products_full", response_model=List[ProductFull])
@@ -322,12 +414,18 @@ def products_full(q: Optional[str] = None, type_id: Optional[int] = None,
                   limit: int = 50, offset: int = 0,
                   sort: str = "id_code", order: str = "asc",
                   db=Depends(get_db)):
-    subq = (db.query(
-                InventoryMovement.product_id,
-                func.sum(func.case([(InventoryMovement.movement_type == "IN", InventoryMovement.quantity),
-                                    (InventoryMovement.movement_type == "OUT", -InventoryMovement.quantity)],
-                                   else_=InventoryMovement.quantity)).label("stock")
-            ).group_by(InventoryMovement.product_id)).subquery()
+    stock_expr = func.sum(
+        case(
+            (InventoryMovement.movement_type == "IN",  InventoryMovement.quantity),
+            (InventoryMovement.movement_type == "OUT", -InventoryMovement.quantity),
+            else_=InventoryMovement.quantity)
+        )
+    subq = (
+    db.query(
+        InventoryMovement.product_id,
+        stock_expr.label("stock")
+        ).group_by(InventoryMovement.product_id)).subquery()
+
 
     selectable = (db.query(Product.id, Product.id_code, Product.description, Product.unit_cost,
                       func.coalesce(subq.c.stock, 0).label("stock"),
@@ -363,12 +461,19 @@ def products_full(q: Optional[str] = None, type_id: Optional[int] = None,
 # Discrepancies
 @app.get("/discrepancies", response_model=List[Discrepancy])
 def list_discrepancies(db=Depends(get_db)):
-    subq = (db.query(
-                InventoryMovement.product_id,
-                func.sum(func.case([(InventoryMovement.movement_type == "IN", InventoryMovement.quantity),
-                                    (InventoryMovement.movement_type == "OUT", -InventoryMovement.quantity)],
-                                   else_=InventoryMovement.quantity)).label("stock")
-            ).group_by(InventoryMovement.product_id)).subquery()
+    stock_expr = func.sum(
+        case(
+            (InventoryMovement.movement_type == "IN",  InventoryMovement.quantity),
+            (InventoryMovement.movement_type == "OUT", -InventoryMovement.quantity),
+            else_=InventoryMovement.quantity
+        )
+    )
+    subq = (
+        db.query(
+            InventoryMovement.product_id,
+            stock_expr.label("stock")
+        )
+        .group_by(InventoryMovement.product_id)).subquery()
 
     rows = (db.query(Product.id, Product.id_code, Product.description, Product.unit_cost,
                      func.coalesce(subq.c.stock, 0).label("stock"),
@@ -412,20 +517,41 @@ def resolve_discrepancy(body: ResolveIn, user: User = Depends(get_current_user),
     db.add(rec); db.commit()
     return {"status": "resolved", "product_id": body.product_id, "type": body.discrepancy_type}
 
-from fastapi.responses import StreamingResponse
-import io
-import csv as _csv
-
-@app.get("/products/{pid}/movements", response_model=List[MovementOut])
-def product_movements(pid: int, db=Depends(get_db), user: User = Depends(get_current_user)):
-    prod = db.query(Product).filter(Product.id == pid).first()
+@app.get("/products/{product_id}/movements")
+def product_history(product_id: int, limit: int = 50, offset: int = 0, order: str = "desc", db=Depends(get_db)):
+    prod = db.query(Product).filter(Product.id == product_id).first()
     if not prod:
         raise HTTPException(404, "Product not found")
-    rows = (db.query(InventoryMovement)
-              .filter(InventoryMovement.product_id == pid)
-              .order_by(InventoryMovement.moved_at.desc(), InventoryMovement.id.desc())
-              .all())
-    return rows
+    q = db.query(
+        InventoryMovement.id,
+        InventoryMovement.movement_type,
+        InventoryMovement.quantity,
+        InventoryMovement.unit_cost,
+        InventoryMovement.moved_at,
+        InventoryMovement.movement_reason,
+        InventoryMovement.note,
+    ).filter(InventoryMovement.product_id == product_id)
+    if order.lower() == "asc":
+        q = q.order_by(InventoryMovement.moved_at.asc())
+    else:
+        q = q.order_by(InventoryMovement.moved_at.desc())
+    rows = q.limit(limit).offset(offset).all()
+    return [dict(
+        id=r[0], movement_type=r[1], quantity=r[2], unit_cost=r[3],
+        moved_at=r[4], movement_reason=r[5], note=r[6]
+    ) for r in rows]
+
+@app.get("/export/movements.csv")
+def export_movements(limit: int = 1000, offset: int = 0, order: str = "desc", db=Depends(get_db)):
+    data = list_movements(limit=limit, offset=offset, order=order, db=db)
+    out = io.StringIO()
+    w = _csv.writer(out)
+    w.writerow(["id","id_code","description","movement_type","quantity","unit_cost","moved_at","movement_reason","note"])
+    for r in data:
+        w.writerow([r["id"], r["id_code"], r["description"], r["movement_type"], r["quantity"], r["unit_cost"], r["moved_at"], r["movement_reason"] or "", r["note"] or ""])
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=movements.csv"})
 
 @app.get("/export/products.csv")
 def export_products(q: Optional[str] = None, type_id: Optional[int] = None, db=Depends(get_db)):
@@ -504,3 +630,87 @@ def export_discrepancies(db=Depends(get_db)):
         writer.writerow(row)
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=discrepancias.csv"})
+
+def _current_stock_subquery(db):
+    from sqlalchemy import case
+    stock_expr = func.sum(
+        case(
+            (InventoryMovement.movement_type == "IN",  InventoryMovement.quantity),
+            (InventoryMovement.movement_type == "OUT", -InventoryMovement.quantity),
+            else_=InventoryMovement.quantity,
+        )
+    )
+    return (
+        db.query(
+            InventoryMovement.product_id,
+            stock_expr.label("stock")
+        ).group_by(InventoryMovement.product_id)
+    ).subquery()
+
+@app.get("/reports/low_stock")
+def report_low_stock(db=Depends(get_db)):
+    subq = _current_stock_subquery(db)
+    rows = (
+        db.query(
+            Product.id_code,
+            Product.description,
+            Product.unit_cost,
+            func.coalesce(subq.c.stock, 0).label("stock"),
+            Product.min_stock,
+            Product.max_stock,
+            ProductType.name.label("product_type"),
+        )
+        .outerjoin(subq, subq.c.product_id == Product.id)
+        .outerjoin(ProductType, ProductType.id == Product.product_type_id)
+        .filter(Product.min_stock.isnot(None))
+        .filter(func.coalesce(subq.c.stock, 0) < Product.min_stock)
+        .order_by(Product.id_code)
+        .all()
+    )
+    return [
+        {
+            "codigo": r[0],
+            "descripcion": r[1],
+            "costo_unitario": r[2],
+            "stock": int(r[3] or 0),
+            "min_stock": r[4],
+            "max_stock": r[5],
+            "tipo": r[6],
+            "faltante": int((r[4] or 0) - int(r[3] or 0)),
+        }
+        for r in rows
+    ]
+
+@app.get("/export/low_stock.csv")
+def export_low_stock(db=Depends(get_db)):
+    data = report_low_stock(db)
+    output = io.StringIO()
+    writer = _csv.writer(output)
+    writer.writerow(["codigo","descripcion","tipo","stock","min_stock","faltante","costo_unitario"])
+    for r in data:
+        writer.writerow([
+            r["codigo"], r["descripcion"], r["tipo"] or "",
+            r["stock"], r["min_stock"] or "", r["faltante"], r["costo_unitario"] or ""
+        ])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=low_stock.csv"},
+    )
+
+@app.post("/policies/bulk_minmax", dependencies=[Depends(require_admin)])
+def bulk_minmax(rows: List[MinMaxRow], db=Depends(get_db)):
+    updated, missing = 0, []
+    for r in rows:
+        p = db.query(Product).filter(Product.id_code == r.id_code).first()
+        if not p:
+            missing.append(r.id_code)
+            continue
+        if r.min_stock is not None:
+            p.min_stock = r.min_stock
+        if r.max_stock is not None:
+            p.max_stock = r.max_stock
+        updated += 1
+    db.commit()
+    return {"updated": updated, "missing_id_codes": missing}

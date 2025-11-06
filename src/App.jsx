@@ -1,5 +1,5 @@
 import React from 'react'
-import { getApiBase, setApiBase, getToken, setToken, authedFetch } from './api'
+import { getApiBase, setApiBase, getToken, setToken, authedFetch, getRoleReliable} from './api'
 import Products from './components/Products'
 import Discrepancies from './components/Discrepancies'
 import LowStock from './components/LowStock'
@@ -10,6 +10,9 @@ export default function App(){
   const [apiBase, setBase] = React.useState(getApiBase())
   const [view, setView] = React.useState('products')
   const [banner, setBanner] = React.useState(null)
+  const [role, setRole] = React.useState('user');
+
+  React.useEffect(() => { (async () => setRole(await getRoleReliable()))(); }, []);
 
   const logout = () => { setTok(''); setToken('') }
   const login = async (email, password) => {
@@ -19,7 +22,8 @@ export default function App(){
     })
     if(!res.ok){ const t = await res.text(); throw new Error(t) }
     const data = await res.json()
-    setTok(data.access_token); setToken(data.access_token)
+    setTok(data.access_token); setToken(data.access_token);
+    setRole(await getRoleReliable());   // <— refresh role after login
     setBanner({ok:true, text:'Sesión iniciada'}); setTimeout(()=>setBanner(null), 4000)
   }
 
@@ -52,6 +56,7 @@ export default function App(){
           </div>
           <button onClick={configApi}>Configurar API</button>
           <button onClick={testApi}>Probar API</button>
+          <div className="muted" style={{alignSelf:'center'}}>Rol: <b>{role}</b></div>
           <button onClick={logout}>Salir</button>
         </div>
       </header>
@@ -67,7 +72,7 @@ export default function App(){
           {view === 'products' && <Products token={token} />}
           {view === 'discrepancies' && <Discrepancies token={token} />}
           {view === 'lowstock' && <LowStock token={token} />}
-          {view === 'movements' && <Movements token={token} />}
+          {view === 'movements' && <Movements token={token} role={role} />}
         </div>
       </div>
     </div>

@@ -305,6 +305,10 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
     access_token = create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
+@app.get("/auth/me")
+def auth_me(user: User = Depends(get_current_user)):
+    return {"email": user.email, "role": user.role}
+
 # Product Types
 @app.get("/types", response_model=List[ProductTypeOut])
 def list_types(db=Depends(get_db)):

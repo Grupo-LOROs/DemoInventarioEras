@@ -1,12 +1,37 @@
 import React from 'react'
-import { getApiBase, authedFetch } from '../api'
+import { getApiBase, authedFetch, getRole } from '../api'
 
 export default function Movements({ token }){
   const [rows, setRows] = React.useState([])
   const [limit, setLimit] = React.useState(50)
   const [offset, setOffset] = React.useState(0)
-  const [form, setForm] = React.useState({ productQuery:'', product:null, movement_type:'OUT', quantity:1, unit_cost:'', movement_reason:'', note:'' })
+  const role = getRole();
+  const allowedByRole = {
+    admin: ['IN','OUT','ADJ'],
+    sales: ['OUT'],
+    purchasing: ['IN'],
+    user: [] // read-only
+  };
+  const allowedTypes = allowedByRole[role] || [];
+  const [form, setForm] = React.useState({
+    productQuery: '',
+    product: null,
+    movement_type: allowedTypes[0] || 'OUT',
+    quantity: 1,
+    unit_cost: '',
+    movement_reason: '',
+    note: ''
+  });
+  React.useEffect(() => {
+    if (!allowedTypes.includes(form.movement_type)) {
+      setForm(f => ({ ...f, movement_type: allowedTypes[0] || 'OUT' }));
+    }
+    // Depend on a stable primitive; this avoids TDZ and stale closures
+  }, [allowedTypes.join(','), form.movement_type]);
+
   const [picker, setPicker] = React.useState([])
+
+
 
   React.useEffect(()=>{ load() }, [limit, offset])
 
@@ -62,11 +87,19 @@ export default function Movements({ token }){
         </div>
         <div>
           <div className="muted">Tipo</div>
-          <select value={form.movement_type} onChange={e=>setForm(f=>({...f, movement_type:e.target.value}))}>
-            <option value="IN">IN</option>
-            <option value="OUT">OUT</option>
-            <option value="ADJ">ADJ</option>
+          <select
+            value={form.movement_type}
+            onChange={e=>setForm(f=>({...f, movement_type:e.target.value}))}
+            title={allowedTypes.length ? '' : 'Tu rol no permite crear movimientos'}
+            disabled={allowedTypes.length === 0}
+          >
+            <option value="IN"  disabled={!allowedTypes.includes('IN')}>IN</option>
+            <option value="OUT" disabled={!allowedTypes.includes('OUT')}>OUT</option>
+            <option value="ADJ" disabled={!allowedTypes.includes('ADJ')}>ADJ</option>
           </select>
+          <div className="muted small" style={{marginTop:6}}>
+            Rol: <b>{role}</b> · Permitidos: {allowedTypes.join(', ') || 'ninguno'}
+          </div>
         </div>
         <div>
           <div className="muted">Cantidad</div>
@@ -85,7 +118,18 @@ export default function Movements({ token }){
           <input value={form.note} onChange={e=>setForm(f=>({...f, note:e.target.value}))} />
         </div>
         <div style={{alignSelf:'flex-end'}}>
-          <button className="btn-primary" onClick={createMovement}>Crear movimiento</button>
+          <button
+            className="btn-primary"
+            onClick={()=>{
+              if (!allowedTypes.includes(form.movement_type)) {
+                return alert(`Tu rol (${role}) no puede crear movimientos ${form.movement_type}`);
+              }
+              createMovement();
+            }}
+            disabled={allowedTypes.length === 0}
+          >
+            Crear movimiento
+          </button>
         </div>
       </div>
 

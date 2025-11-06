@@ -32,3 +32,18 @@ export async function authedFetch(path, opts={}) {
   }
   return resp;
 }
+
+export function parseJwt(token) {
+  try {
+    const [, payload] = token.split('.');
+    return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+  } catch { return {}; }
+}
+
+export function getRole() {
+  const t = getToken();
+  if (!t) return 'user';
+  const p = parseJwt(t);
+  return p.role || p.roles?.[0] || 'user';
+}
+

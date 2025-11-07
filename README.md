@@ -4,8 +4,6 @@ Concept-test inventory system for a renewable energy company.
 Backend: **FastAPI + SQLite**. Frontends: **Plain SPA** and **React (Vite)**.  
 Includes role-based movements, low-stock reports, discrepancies, product history, barcode scanning (pyzbar), and simple sales (with OUT movement).
 
-> **Note**: I couldn’t fetch the GitHub URL you shared (likely private). This README matches the code and filenames we built together. If your repo paths differ, adjust the folder names below.
-
 ---
 
 ## ✨ Features

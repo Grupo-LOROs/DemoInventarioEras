@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import StreamingResponse
 import io, csv as _csv
 
@@ -14,6 +14,16 @@ from pydantic import BaseModel
 from sqlalchemy import (create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey, CheckConstraint,
                         func, select, and_, or_, case)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+
+# ---------- pzybar support --------
+try:
+    from pyzbar.pyzbar import decode as zbar_decode
+    _HAS_PYZBAR = True
+    _PYZBAR_ERR = ""
+except Exception as _e:
+    _HAS_PYZBAR = False
+    _PYZBAR_ERR = str(_e)
+from PIL import Image
 
 # ---------- .env support ----------
 try:
@@ -97,6 +107,24 @@ class DiscrepancyResolution(Base):
     unit_cost_at = Column(Float, nullable=True)
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_at = Column(DateTime, default=datetime.utcnow)
+
+class Sale(Base):
+    __tablename__ = "sales"
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    customer = Column(String, nullable=True)
+    note = Column(Text, nullable=True)
+    total = Column(Float, nullable=True)
+
+class SaleItem(Base):
+    __tablename__ = "sale_items"
+    id = Column(Integer, primary_key=True, index=True)
+    sale_id = Column(Integer, ForeignKey("sales.id", ondelete="CASCADE"))
+    product_id = Column(Integer, ForeignKey("products.id"))
+    quantity = Column(Integer, nullable=False)
+    unit_price = Column(Float, nullable=True)
+    subtotal = Column(Float, nullable=True)
+
 
 # ---------- Pydantic ----------
 class Token(BaseModel):
@@ -198,6 +226,27 @@ class MinMaxRow(BaseModel):
     min_stock: Optional[int] = None
     max_stock: Optional[int] = None
 
+class SaleIn(BaseModel):
+    product_id: Optional[int] = None
+    id_code: Optional[str] = None
+    quantity: int
+    unit_price: Optional[float] = None
+    customer: Optional[str] = None
+    note: Optional[str] = None
+
+class SaleOut(BaseModel):
+    id: int
+    created_at: datetime
+    product_id: int
+    id_code: str
+    quantity: int
+    unit_price: Optional[float]
+    subtotal: float
+    total: float
+    customer: Optional[str]
+    note: Optional[str]
+
+
 # ---------- Auth helpers ----------
 
 def _normalize_password(p: str) -> str:
@@ -269,7 +318,10 @@ def _current_stock_subquery(db):
         ).group_by(InventoryMovement.product_id)
     ).subquery()
 
-
+def _require_sales_role(user: User):
+    if user.role not in ("admin", "sales"):
+        raise HTTPException(403, f"Role '{user.role}' no puede crear ventas")
+    
 # ---------- App ----------
 app = FastAPI(title="Inventory API v2", version="2.1.0")
 app.add_middleware(
@@ -718,3 +770,116 @@ def bulk_minmax(rows: List[MinMaxRow], db=Depends(get_db)):
         updated += 1
     db.commit()
     return {"updated": updated, "missing_id_codes": missing}
+
+@app.post("/barcode/decode")
+def barcode_decode(file: UploadFile = File(...), db=Depends(get_db)):
+    if not _HAS_PYZBAR:
+        raise HTTPException(
+            status_code=501,
+            detail=f"pyzbar/zbar no disponible: install zbar + pip install pyzbar Pillow. Loader error: {_PYZBAR_ERR}"
+        )
+    try:
+        img_bytes = file.file.read()
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(400, f"Imagen inválida: {e}")
+
+    results = zbar_decode(img)
+    payload = []
+    for r in results:
+        code = r.data.decode("utf-8", errors="ignore").strip()
+        sym = r.type
+        prod = db.query(Product).filter(Product.id_code == code).first()
+        payload.append({
+            "data": code,
+            "symbology": sym,
+            "product": None if not prod else {
+                "id": prod.id,
+                "id_code": prod.id_code,
+                "description": prod.description
+            }
+        })
+    return {"count": len(payload), "barcodes": payload}
+
+@app.post("/sales", response_model=SaleOut)
+def create_sale(s: SaleIn, user: User = Depends(get_current_user), db=Depends(get_db)):
+    _require_sales_role(user)
+    if not s.product_id and not s.id_code:
+        raise HTTPException(400, "Provide product_id or id_code")
+
+    if s.product_id:
+        prod = db.query(Product).filter(Product.id == s.product_id).first()
+    else:
+        prod = db.query(Product).filter(Product.id_code == s.id_code).first()
+
+    if not prod:
+        raise HTTPException(404, "Product not found")
+
+    qty = int(s.quantity)
+    if qty <= 0:
+        raise HTTPException(400, "quantity must be > 0")
+
+    unit_price = s.unit_price if s.unit_price is not None else prod.unit_cost
+    unit_price = float(unit_price) if unit_price is not None else 0.0
+    subtotal = unit_price * qty
+
+    sale = Sale(customer=s.customer, note=s.note, total=subtotal)
+    db.add(sale); db.commit(); db.refresh(sale)
+
+    item = SaleItem(sale_id=sale.id, product_id=prod.id, quantity=qty, unit_price=unit_price, subtotal=subtotal)
+    db.add(item)
+
+    # Register OUT movement linked logically via note/reason
+    mv = InventoryMovement(
+        product_id=prod.id,
+        movement_type="OUT",
+        quantity=qty,
+        unit_cost=unit_price,
+        movement_reason="SALE",
+        note=f"SALE #{sale.id}" + (f" · {s.note}" if s.note else "")
+    )
+    db.add(mv)
+    db.commit()
+
+    return SaleOut(
+        id=sale.id,
+        created_at=sale.created_at,
+        product_id=prod.id,
+        id_code=prod.id_code,
+        quantity=qty,
+        unit_price=unit_price,
+        subtotal=subtotal,
+        total=subtotal,
+        customer=sale.customer,
+        note=sale.note
+    )
+
+@app.get("/sales")
+def list_sales(limit: int = 50, offset: int = 0, order: str = "desc", db=Depends(get_db)):
+    q = (
+        db.query(
+            Sale.id, Sale.created_at, Sale.customer, Sale.note, Sale.total,
+            SaleItem.product_id, Product.id_code, Product.description,
+            SaleItem.quantity, SaleItem.unit_price, SaleItem.subtotal
+        )
+        .join(SaleItem, SaleItem.sale_id == Sale.id)
+        .join(Product, Product.id == SaleItem.product_id)
+    )
+    q = q.order_by(Sale.created_at.asc() if order.lower()=="asc" else Sale.created_at.desc())
+    rows = q.limit(limit).offset(offset).all()
+    return [dict(
+        id=r[0], created_at=r[1], customer=r[2], note=r[3], total=r[4],
+        product_id=r[5], id_code=r[6], description=r[7],
+        quantity=r[8], unit_price=r[9], subtotal=r[10],
+    ) for r in rows]
+
+@app.get("/export/sales.csv")
+def export_sales(limit: int = 1000, offset: int = 0, order: str = "desc", db=Depends(get_db)):
+    data = list_sales(limit=limit, offset=offset, order=order, db=db)
+    out = io.StringIO(); w = _csv.writer(out)
+    w.writerow(["sale_id","created_at","customer","id_code","description","quantity","unit_price","subtotal","total","note"])
+    for r in data:
+        w.writerow([r["id"], r["created_at"], r["customer"] or "", r["id_code"], r["description"], r["quantity"], r["unit_price"] or "", r["subtotal"], r["total"], r["note"] or ""])
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv",
+                             headers={"Content-Disposition":"attachment; filename=sales.csv"})

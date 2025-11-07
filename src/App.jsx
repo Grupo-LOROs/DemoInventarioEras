@@ -4,6 +4,7 @@ import Products from './components/Products'
 import Discrepancies from './components/Discrepancies'
 import LowStock from './components/LowStock'
 import Movements from './components/Movements'
+import Sales from './components/Sales'
 
 export default function App(){
   const [token, setTok] = React.useState(getToken())
@@ -53,6 +54,7 @@ export default function App(){
             <button aria-selected={view==='discrepancies'} onClick={()=>setView('discrepancies')}>Discrepancias</button>
             <button aria-selected={view==='lowstock'} onClick={()=>setView('lowstock')}>Bajo stock</button>
             <button aria-selected={view==='movements'} onClick={()=>setView('movements')}>Movimientos</button>
+            <button aria-selected={view==='sales'} onClick={()=>setView('sales')}>Ventas</button>
           </div>
           <button onClick={configApi}>Configurar API</button>
           <button onClick={testApi}>Probar API</button>
@@ -73,6 +75,7 @@ export default function App(){
           {view === 'discrepancies' && <Discrepancies token={token} />}
           {view === 'lowstock' && <LowStock token={token} />}
           {view === 'movements' && <Movements token={token} role={role} />}
+          {view === 'sales' && <Sales token={token} role={role} />}
         </div>
       </div>
     </div>

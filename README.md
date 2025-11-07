@@ -44,9 +44,7 @@ Includes role-based movements, low-stock reports, discrepancies, product history
 │           ├─ LowStock.jsx
 │           ├─ Movements.jsx
 │           └─ Sales.jsx
-└─ data/
-   ├─ Almacen_Joined(INVENTARIO).csv
-   └─ inventario_limpio.csv
+└─ inventario_limpio.csv
 ```
 
 > If your repo already has a different structure, keep files in place and only use the commands, endpoints, and env variables below.
@@ -311,8 +309,3 @@ curl -OJ "http://127.0.0.1:8000/export/low_stock.csv"
 - Add proper migrations (Alembic).
 - Add structured logging & metrics.
 
----
-
-## 📄 License
-
-MIT (or your preferred license).

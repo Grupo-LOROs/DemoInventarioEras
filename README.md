@@ -144,7 +144,7 @@ Place your CSV (e.g., `data/inventario_limpio.csv`) and run:
 
 ```bash
 export DATABASE_URL=sqlite:///./inventory.db   # Windows: $env:DATABASE_URL="sqlite:///./inventory.db"
-python seed.py data/inventario_limpio.csv
+python seed.py inventario_limpio.csv
 ```
 
 ### 4) Create an admin user

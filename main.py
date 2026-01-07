@@ -246,6 +246,11 @@ class SaleOut(BaseModel):
     customer: Optional[str]
     note: Optional[str]
 
+class UserUpdate(BaseModel):
+    email: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+
 
 # ---------- Auth helpers ----------
 
@@ -430,9 +435,7 @@ def create_movement(m: MovementIn, user: User = Depends(get_current_user), db=De
     # Role-based policy
     allowed_by_role = {
         "admin": {"IN", "OUT", "ADJ"},
-        "sales": {"OUT"},
-        "purchasing": {"IN"},
-        "user": set(),  # default read-only
+        "user": {"IN", "OUT", "ADJ"},
     }
     allowed = allowed_by_role.get(user.role, set())
 
@@ -883,3 +886,63 @@ def export_sales(limit: int = 1000, offset: int = 0, order: str = "desc", db=Dep
     out.seek(0)
     return StreamingResponse(iter([out.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition":"attachment; filename=sales.csv"})
+
+@app.get("/users", response_model=List[UserOut], dependencies=[Depends(require_admin)])
+def list_users(limit: int = 50, offset: int = 0, db=Depends(get_db)):
+    """
+    Lista usuarios (admin only). Paginado: limit/offset.
+    """
+    users = db.query(User).order_by(User.email).offset(offset).limit(limit).all()
+    return users
+
+@app.post("/users", response_model=UserOut, dependencies=[Depends(require_admin)])
+def create_user_admin(payload: UserCreate, db=Depends(get_db)):
+    """
+    Crear usuario (admin). Usa la misma Pydantic UserCreate (email,password,role).
+    """
+    if db.query(User).filter(User.email == payload.email).first():
+        raise HTTPException(400, "Email already registered")
+    u = User(email=payload.email, password_hash=get_password_hash(payload.password), role=payload.role)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+@app.get("/users/{user_id}", response_model=UserOut, dependencies=[Depends(require_admin)])
+def get_user_admin(user_id: int, db=Depends(get_db)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "User not found")
+    return u
+
+@app.put("/users/{user_id}", response_model=UserOut, dependencies=[Depends(require_admin)])
+def update_user_admin(user_id: int, payload: UserUpdate, db=Depends(get_db)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "User not found")
+
+    if payload.email and payload.email != u.email:
+        # chequear unicidad
+        if db.query(User).filter(User.email == payload.email).first():
+            raise HTTPException(400, "Email already registered")
+        u.email = payload.email
+
+    if payload.role:
+        u.role = payload.role
+
+    if payload.password:
+        u.password_hash = get_password_hash(payload.password)
+
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+@app.delete("/users/{user_id}", dependencies=[Depends(require_admin)])
+def delete_user_admin(user_id: int, db=Depends(get_db)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(404, "User not found")
+    db.delete(u)
+    db.commit()
+    return {"detail": "deleted"}

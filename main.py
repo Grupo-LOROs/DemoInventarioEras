@@ -1,4 +1,6 @@
 import os
+import shutil
+import enum
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -13,7 +15,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import (create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey, CheckConstraint,
                         func, select, and_, or_, case)
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # ---------- pzybar support --------
 try:
@@ -124,6 +126,48 @@ class SaleItem(Base):
     quantity = Column(Integer, nullable=False)
     unit_price = Column(Float, nullable=True)
     subtotal = Column(Float, nullable=True)
+
+# --- NUEVOS MODELOS PARA ÓRDENES ---
+class OrderStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+
+class OrderType(str, enum.Enum):
+    SALE = "SALE"       # Salida de mercancía
+    PURCHASE = "PURCHASE" # Entrada de mercancía
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_code = Column(String, unique=True, index=True) # Ej: ORD-2026-001
+    customer_name = Column(String) # Cliente o Proveedor
+    type = Column(String) # SALE o PURCHASE
+    status = Column(String, default=OrderStatus.PENDING)
+    evidence_photo_url = Column(String, nullable=True) # Ruta de la foto
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relación con items
+    items = relationship("OrderItem", back_populates="order")
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"))
+    product_id = Column(Integer, ForeignKey("products.id"))
+    quantity = Column(Integer) # Cantidad requerida
+    
+    order = relationship("Order", back_populates="items")
+    product = relationship("Product") # Para acceder al código y descripción
+
+class Warehouse(Base):
+    __tablename__ = "warehouses"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True)
+    location = Column(String)
 
 
 # ---------- Pydantic ----------
@@ -251,6 +295,37 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
     role: Optional[str] = None
 
+# --- SCHEMAS PARA ÓRDENES ---
+class OrderItemOut(BaseModel):
+    product_id: int
+    product_code: str
+    description: str
+    quantity: int
+    
+    class Config:
+        from_attributes = True
+
+class OrderOut(BaseModel):
+    id: int
+    order_code: str
+    type: str
+    customer_name: str
+    status: str
+    items: List[OrderItemOut]
+
+    class Config:
+        from_attributes = True
+
+class WarehouseCreate(BaseModel):
+    name: str
+    location: str
+
+class TransferRequest(BaseModel):
+    product_id: int
+    from_warehouse_id: int
+    to_warehouse_id: int
+    quantity: int
+    notes: Optional[str] = None
 
 # ---------- Auth helpers ----------
 
@@ -339,6 +414,9 @@ app.add_middleware(
 
 # ---------- Startup: create tables (dev) ----------
 Base.metadata.create_all(bind=engine)
+
+# ---------- Folders ----------
+os.makedirs("uploads/evidence", exist_ok=True)
 
 # ---------- Routes ----------
 @app.get("/health")
@@ -946,3 +1024,166 @@ def delete_user_admin(user_id: int, db=Depends(get_db)):
     db.delete(u)
     db.commit()
     return {"detail": "deleted"}
+
+@app.get("/orders/search", response_model=OrderOut)
+def search_order(code: str, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.order_code == code).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Orden no encontrada")
+    
+    # Construimos la respuesta plana para facilitar a Flutter
+    response_items = []
+    for item in order.items:
+        response_items.append({
+            "product_id": item.product.id,
+            "product_code": item.product.id_code,
+            "description": item.product.description,
+            "quantity": item.quantity
+        })
+        
+    return {
+        "id": order.id,
+        "order_code": order.order_code,
+        "type": order.type,
+        "customer_name": order.customer_name,
+        "status": order.status,
+        "items": response_items
+    }
+
+# 2. FINALIZAR ORDEN Y SUBIR EVIDENCIA
+@app.post("/orders/{order_id}/complete")
+def complete_order(
+    order_id: int, 
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user) # Requiere auth
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Orden no encontrada")
+    
+    if order.status == OrderStatus.COMPLETED:
+         raise HTTPException(status_code=400, detail="La orden ya fue completada")
+
+    # 1. Guardar la Foto
+    file_location = f"uploads/evidence/{order.order_code}_{file.filename}"
+    with open(file_location, "wb+") as file_object:
+        shutil.copyfileobj(file.file, file_object)
+    
+    # 2. Generar Movimientos de Inventario Automáticos
+    # Si es VENTA -> Restamos stock (OUT)
+    # Si es COMPRA -> Sumamos stock (IN)
+    mov_type = "OUT" if order.type == "SALE" else "IN"
+    
+    for item in order.items:
+        new_movement = Movement(
+            product_id=item.product_id,
+            movement_type=mov_type,
+            quantity=item.quantity,
+            user_id=current_user.id, # Usuario que escaneó
+            notes=f"Orden completada: {order.order_code}",
+            moved_at=datetime.utcnow()
+        )
+        db.add(new_movement)
+        
+        # Actualizar stock maestro del producto
+        product = db.query(Product).filter(Product.id == item.product_id).first()
+        if mov_type == "IN":
+            product.stock += item.quantity
+        else:
+            product.stock -= item.quantity
+
+    # 3. Actualizar Estado de la Orden
+    order.status = OrderStatus.COMPLETED
+    order.evidence_photo_url = file_location
+    
+    db.commit()
+    return {"message": "Orden completada y stock actualizado"}
+
+# 3. CREAR ORDEN (Seed/Prueba para que tengas datos que escanear)
+class OrderCreateItem(BaseModel):
+    product_id: int
+    quantity: int
+
+class OrderCreate(BaseModel):
+    order_code: str
+    customer_name: str
+    type: str # SALE o PURCHASE
+    items: List[OrderCreateItem]
+
+@app.post("/orders")
+def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
+    # Validar que no exista
+    if db.query(Order).filter(Order.order_code == order_data.order_code).first():
+        raise HTTPException(status_code=400, detail="Código de orden ya existe")
+
+    new_order = Order(
+        order_code=order_data.order_code,
+        customer_name=order_data.customer_name,
+        type=order_data.type,
+        status=OrderStatus.PENDING
+    )
+    db.add(new_order)
+    db.commit() # Commit para obtener ID
+    db.refresh(new_order)
+
+    for item in order_data.items:
+        new_item = OrderItem(
+            order_id=new_order.id,
+            product_id=item.product_id,
+            quantity=item.quantity
+        )
+        db.add(new_item)
+    
+    db.commit()
+    return {"message": "Orden creada exitosamente"}
+
+@app.post("/warehouses")
+def create_warehouse(wh: WarehouseCreate, db: Session = Depends(get_db)):
+    new_wh = Warehouse(name=wh.name, location=wh.location)
+    db.add(new_wh)
+    db.commit()
+    return {"message": "Almacén creado"}
+
+@app.get("/warehouses")
+def get_warehouses(db: Session = Depends(get_db)):
+    return db.query(Warehouse).all()
+
+@app.post("/movements/transfer")
+def create_transfer(
+    transfer: TransferRequest, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # 1. Validar Stock (Simplificado: Asumimos stock global por ahora, 
+    # en un sistema real validarías stock por almacén origen)
+    product = db.query(Product).filter(Product.id == transfer.product_id).first()
+    if product.stock < transfer.quantity:
+        raise HTTPException(status_code=400, detail="Stock global insuficiente")
+
+    # 2. Registrar Salida del Origen
+    mov_out = Movement(
+        product_id=transfer.product_id,
+        movement_type="TRANSFER_OUT",
+        quantity=transfer.quantity,
+        user_id=current_user.id,
+        notes=f"Transferencia hacia Alm. {transfer.to_warehouse_id} | {transfer.notes or ''}",
+        moved_at=datetime.utcnow()
+    )
+    
+    # 3. Registrar Entrada en Destino
+    mov_in = Movement(
+        product_id=transfer.product_id,
+        movement_type="TRANSFER_IN",
+        quantity=transfer.quantity,
+        user_id=current_user.id,
+        notes=f"Recepción desde Alm. {transfer.from_warehouse_id} | {transfer.notes or ''}",
+        moved_at=datetime.utcnow()
+    )
+
+    db.add(mov_out)
+    db.add(mov_in)
+    
+    # El stock global no cambia (solo se mueve), pero registramos el movimiento
+    db.commit()
+    return {"message": "Transferencia exitosa"}

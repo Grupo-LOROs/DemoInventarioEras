@@ -14,7 +14,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import (create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey, CheckConstraint,
-                        func, select, and_, or_, case)
+                        func, select, and_, or_, case, UniqueConstraint)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # ---------- pzybar support --------
@@ -72,6 +72,7 @@ class Product(Base):
     id = Column(Integer, primary_key=True)
     id_code = Column(String, unique=True, nullable=False, index=True)
     description = Column(Text, nullable=False)
+    stock = Column(Integer, default=0)
     unit_cost = Column(Float)
     product_type_id = Column(Integer, ForeignKey("product_types.id"), nullable=True)
     min_stock = Column(Integer, nullable=True)
@@ -168,6 +169,22 @@ class Warehouse(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True)
     location = Column(String)
+
+class WarehouseStock(Base):
+    __tablename__ = "warehouse_stocks"
+    id = Column(Integer, primary_key=True, index=True)
+    # Referencias a tablas existentes
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    warehouse_id = Column(Integer, ForeignKey("warehouses.id"), nullable=False) 
+    quantity = Column(Integer, default=0)
+
+    # Relaciones
+    product = relationship("Product")
+    warehouse = relationship("Warehouse")
+
+    __table_args__ = (
+        UniqueConstraint('product_id', 'warehouse_id', name='_product_warehouse_uc'),
+    )
 
 # ---------- Pydantic ----------
 class Token(BaseModel):
@@ -1049,55 +1066,68 @@ def search_order(code: str, db: Session = Depends(get_db)):
         "items": response_items
     }
 
-# 2. FINALIZAR ORDEN Y SUBIR EVIDENCIA
 @app.post("/orders/{order_id}/complete")
 def complete_order(
     order_id: int, 
     file: UploadFile = File(...), 
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user) # Requiere auth
+    current_user: User = Depends(get_current_user)
 ):
     order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Orden no encontrada")
-    
-    if order.status == OrderStatus.COMPLETED:
-         raise HTTPException(status_code=400, detail="La orden ya fue completada")
+    if not order: raise HTTPException(404, "Orden no encontrada")
+    if order.status == "COMPLETED": raise HTTPException(400, "Orden ya completada")
 
-    # 1. Guardar la Foto
+    # Guardar evidencia
     file_location = f"uploads/evidence/{order.order_code}_{file.filename}"
     with open(file_location, "wb+") as file_object:
         shutil.copyfileobj(file.file, file_object)
     
-    # 2. Generar Movimientos de Inventario Automáticos
-    # Si es VENTA -> Restamos stock (OUT)
-    # Si es COMPRA -> Sumamos stock (IN)
-    mov_type = "OUT" if order.type == "SALE" else "IN"
+    # Configurar tipo
+    is_purchase = order.type == "PURCHASE"
+    mov_type = "IN" if is_purchase else "OUT"
+    mov_reason = "purchase" if is_purchase else "sale"
     
+    DEFAULT_WAREHOUSE_ID = 1 # Por ahora, todo entra/sale del almacén principal
+
     for item in order.items:
-        new_movement = Movement(
+        # A. Actualizar Stock por Almacén
+        wh_stock = db.query(WarehouseStock).filter(
+            WarehouseStock.product_id == item.product_id,
+            WarehouseStock.warehouse_id == DEFAULT_WAREHOUSE_ID
+        ).first()
+        
+        if not wh_stock:
+            wh_stock = WarehouseStock(product_id=item.product_id, warehouse_id=DEFAULT_WAREHOUSE_ID, quantity=0)
+            db.add(wh_stock)
+
+        # B. Actualizar Stock Global (Product.stock)
+        product = db.query(Product).filter(Product.id == item.product_id).first()
+
+        if is_purchase:
+            wh_stock.quantity += item.quantity
+            if product: product.stock += item.quantity # Suma Global
+        else:
+            # Validar stock suficiente para venta
+            if wh_stock.quantity < item.quantity:
+                raise HTTPException(400, f"Stock insuficiente en almacén para el producto {item.product_id}")
+            wh_stock.quantity -= item.quantity
+            if product: product.stock -= item.quantity # Resta Global
+
+        # C. Registrar Movimiento Histórico
+        new_mov = InventoryMovement(
             product_id=item.product_id,
             movement_type=mov_type,
+            movement_reason=mov_reason,
             quantity=item.quantity,
-            user_id=current_user.id, # Usuario que escaneó
-            notes=f"Orden completada: {order.order_code}",
+            note=f"Orden {order.order_code} | Por: {current_user.email}",
             moved_at=datetime.utcnow()
         )
-        db.add(new_movement)
-        
-        # Actualizar stock maestro del producto
-        product = db.query(Product).filter(Product.id == item.product_id).first()
-        if mov_type == "IN":
-            product.stock += item.quantity
-        else:
-            product.stock -= item.quantity
+        db.add(new_mov)
 
-    # 3. Actualizar Estado de la Orden
-    order.status = OrderStatus.COMPLETED
+    order.status = "COMPLETED"
     order.evidence_photo_url = file_location
-    
     db.commit()
-    return {"message": "Orden completada y stock actualizado"}
+    return {"message": "Orden procesada y stocks actualizados"}
 
 # 3. CREAR ORDEN (Seed/Prueba para que tengas datos que escanear)
 class OrderCreateItem(BaseModel):
@@ -1154,35 +1184,57 @@ def create_transfer(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # 1. Validar Stock (Simplificado: Asumimos stock global por ahora, 
-    # en un sistema real validarías stock por almacén origen)
-    product = db.query(Product).filter(Product.id == transfer.product_id).first()
-    if product.stock < transfer.quantity:
-        raise HTTPException(status_code=400, detail="Stock global insuficiente")
+    # 1. Validar Stock en Origen (Tabla Pivote)
+    stock_origin = db.query(WarehouseStock).filter(
+        WarehouseStock.product_id == transfer.product_id,
+        WarehouseStock.warehouse_id == transfer.from_warehouse_id
+    ).first()
 
-    # 2. Registrar Salida del Origen
-    mov_out = Movement(
+    current_qty = stock_origin.quantity if stock_origin else 0
+    if current_qty < transfer.quantity:
+        raise HTTPException(status_code=400, detail=f"Stock insuficiente en origen. Disponible: {current_qty}")
+
+    # 2. Buscar/Crear Stock en Destino
+    stock_dest = db.query(WarehouseStock).filter(
+        WarehouseStock.product_id == transfer.product_id,
+        WarehouseStock.warehouse_id == transfer.to_warehouse_id
+    ).first()
+
+    if not stock_dest:
+        stock_dest = WarehouseStock(
+            product_id=transfer.product_id, 
+            warehouse_id=transfer.to_warehouse_id, 
+            quantity=0
+        )
+        db.add(stock_dest)
+    
+    # 3. MOVER FÍSICAMENTE (Resta y Suma en almacenes)
+    stock_origin.quantity -= transfer.quantity
+    stock_dest.quantity += transfer.quantity
+    
+    # Nota: En una transferencia interna, el 'Product.stock' (Global) NO cambia, 
+    # porque la mercancía sigue dentro de la empresa.
+
+    # 4. Registrar Historia (Bitácora)
+    mov_out = InventoryMovement(
         product_id=transfer.product_id,
-        movement_type="TRANSFER_OUT",
+        movement_type="OUT",
+        movement_reason="transfer",
         quantity=transfer.quantity,
-        user_id=current_user.id,
-        notes=f"Transferencia hacia Alm. {transfer.to_warehouse_id} | {transfer.notes or ''}",
+        note=f"Transferencia SALIDA a Alm. {transfer.to_warehouse_id} | {transfer.notes or ''} | Por: {current_user.email}",
         moved_at=datetime.utcnow()
     )
-    
-    # 3. Registrar Entrada en Destino
-    mov_in = Movement(
+    mov_in = InventoryMovement(
         product_id=transfer.product_id,
-        movement_type="TRANSFER_IN",
+        movement_type="IN",
+        movement_reason="transfer",
         quantity=transfer.quantity,
-        user_id=current_user.id,
-        notes=f"Recepción desde Alm. {transfer.from_warehouse_id} | {transfer.notes or ''}",
+        note=f"Transferencia ENTRADA de Alm. {transfer.from_warehouse_id} | {transfer.notes or ''} | Por: {current_user.email}",
         moved_at=datetime.utcnow()
     )
 
     db.add(mov_out)
     db.add(mov_in)
-    
-    # El stock global no cambia (solo se mueve), pero registramos el movimiento
     db.commit()
+    
     return {"message": "Transferencia exitosa"}

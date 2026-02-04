@@ -169,7 +169,6 @@ class Warehouse(Base):
     name = Column(String, unique=True)
     location = Column(String)
 
-
 # ---------- Pydantic ----------
 class Token(BaseModel):
     access_token: str

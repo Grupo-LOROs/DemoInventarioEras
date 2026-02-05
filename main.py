@@ -1087,7 +1087,7 @@ def complete_order(
     mov_type = "IN" if is_purchase else "OUT"
     mov_reason = "purchase" if is_purchase else "sale"
     
-    DEFAULT_WAREHOUSE_ID = 1 # Por ahora, todo entra/sale del almacén principal
+    DEFAULT_WAREHOUSE_ID = 1
 
     for item in order.items:
         # A. Actualizar Stock por Almacén
@@ -1103,15 +1103,20 @@ def complete_order(
         # B. Actualizar Stock Global (Product.stock)
         product = db.query(Product).filter(Product.id == item.product_id).first()
 
-        if is_purchase:
-            wh_stock.quantity += item.quantity
-            if product: product.stock += item.quantity # Suma Global
-        else:
-            # Validar stock suficiente para venta
-            if wh_stock.quantity < item.quantity:
-                raise HTTPException(400, f"Stock insuficiente en almacén para el producto {item.product_id}")
-            wh_stock.quantity -= item.quantity
-            if product: product.stock -= item.quantity # Resta Global
+        if product:
+            # --- CORRECCIÓN AQUÍ: Si es None, usar 0 ---
+            current_global_stock = product.stock if product.stock is not None else 0
+            
+            if is_purchase:
+                wh_stock.quantity += item.quantity
+                product.stock = current_global_stock + item.quantity # Ahora sumamos sobre 0, no sobre None
+            else:
+                # Validar stock suficiente en el ALMACÉN (Lo real)
+                if wh_stock.quantity < item.quantity:
+                    raise HTTPException(400, f"Stock insuficiente en almacén para el producto {product.description}")
+                
+                wh_stock.quantity -= item.quantity
+                product.stock = current_global_stock - item.quantity 
 
         # C. Registrar Movimiento Histórico
         new_mov = InventoryMovement(
